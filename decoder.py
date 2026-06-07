@@ -43,6 +43,9 @@ REALTIME_SCAN_SEC = 30.0
 REALTIME_SCAN_INTERVAL = 1.0
 MAX_DECODE_SECONDS = float(os.getenv("ACOUSTEG_MAX_DECODE_SEC", "90"))
 MAX_UPLOAD_BYTES = int(os.getenv("ACOUSTEG_MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
+# Cap how many symbols a single frame attempt reads. 128 payload bytes easily
+# covers a long URL + RS(12) parity; reading 256 doubled the work per scan.
+MAX_PAYLOAD_BYTES = int(os.getenv("ACOUSTEG_MAX_PAYLOAD_BYTES", "128"))
 
 _SOS: Optional[np.ndarray] = None
 
@@ -91,11 +94,18 @@ class ToneCache:
         t_sym = np.linspace(0, cfg.symbol_duration, n_sym, endpoint=False)
         t_sync = np.linspace(0, cfg.sync_duration, n_sync, endpoint=False)
 
+        self._sr = cfg.sample_rate
+        self._nsym = n_sym
         self._tones_norm: dict[str, np.ndarray] = {}
+        # Precomputed complex exponentials per tone (length n_sym) — vectorised
+        # Goertzel/DFT magnitude in O(n) numpy instead of a Python sample loop.
+        self._cexp: dict[int, np.ndarray] = {}
+        idx_sym = np.arange(n_sym)
         for i in range(cfg.num_tones):
             freq = cfg.base_freq + i * cfg.freq_step
             t = (np.sin(2 * np.pi * freq * t_sym) * win_sym).astype(np.float64)
             self._tones_norm[str(i)] = t / (np.linalg.norm(t) + 1e-12)
+            self._cexp[round(freq)] = np.exp(-2j * np.pi * freq * idx_sym / cfg.sample_rate)
 
         sync = (np.sin(2 * np.pi * cfg.sync_freq * t_sync) * win_sync).astype(np.float64)
         self._sync_norm = sync / (np.linalg.norm(sync) + 1e-12)
@@ -116,6 +126,14 @@ class ToneCache:
     def guard_len(self) -> int:
         return len(self._guard)
 
+    def complex_ref(self, freq: float, n: int) -> np.ndarray:
+        key = round(freq)
+        full = self._cexp.get(key)
+        if full is None or len(full) < n:
+            full = np.exp(-2j * np.pi * freq * np.arange(max(n, self._nsym)) / self._sr)
+            self._cexp[key] = full
+        return full[:n]
+
 
 _CACHE: Optional[ToneCache] = None
 
@@ -132,17 +150,17 @@ def _tone_freq(idx: int) -> float:
 
 
 def _goertzel_power(chunk: np.ndarray, freq: float, sr: int) -> float:
+    """DFT-bin magnitude² at `freq` — vectorised (single complex dot product).
+
+    Replaces the old per-sample Python loop which blocked the event loop and
+    made live decoding far too slow on shared/free-tier CPUs.
+    """
     n = len(chunk)
     if n == 0:
         return 0.0
-    k = int(0.5 + n * freq / sr)
-    w = 2 * np.pi * k / n
-    c = 2 * np.cos(w)
-    s0 = s1 = s2 = 0.0
-    for x in chunk:
-        s0 = x + c * s1 - s2
-        s2, s1 = s1, s0
-    return max(s2 * s2 + s1 * s1 - c * s1 * s2, 1e-20)
+    ref = _get_cache().complex_ref(freq, n)
+    val = np.dot(chunk, ref)
+    return max(float(val.real * val.real + val.imag * val.imag), 1e-20)
 
 
 def _get_sos() -> np.ndarray:
@@ -256,7 +274,8 @@ def decode_symbols(work: np.ndarray, sync_start: int, eq: Optional[np.ndarray]) 
     step = sym_len + cache.guard_len()
     pos = sync_start + cache.sync_len() + cache.guard_len()
     out: list[str] = []
-    max_sym = PREAMBLE_LEN + LENGTH_SYM + octal_symbols_for_bytes(256) + CRC_SYM + FOOTER_LEN
+    max_sym = (PREAMBLE_LEN + LENGTH_SYM + octal_symbols_for_bytes(MAX_PAYLOAD_BYTES)
+               + CRC_SYM + FOOTER_LEN)
     for _ in range(max_sym):
         if pos + sym_len > len(work):
             break
@@ -498,12 +517,21 @@ class StreamSession:
         self._buf = np.roll(self._buf, -n)
         self._buf[-n:] = mono
 
-    def scan(self) -> list[dict]:
-        now = time.monotonic()
+    def should_scan(self, now: Optional[float] = None) -> bool:
+        """Cheap, non-blocking check: is it time to run a (heavy) scan?"""
+        now = time.monotonic() if now is None else now
         if now < self._cooldown or now - self._last_scan < REALTIME_SCAN_INTERVAL:
-            return []
+            return False
+        return self.total_samples >= self._min_samples
+
+    def snapshot(self) -> np.ndarray:
+        """Copy the rolling buffer on the caller's thread (event loop)."""
+        return self._buf.copy()
+
+    def scan_window(self, window: np.ndarray) -> list[dict]:
+        """Heavy DSP — must run off the event loop (thread executor)."""
+        now = time.monotonic()
         self._last_scan = now
-        window = self._buf.copy()
         if len(window) < self._min_samples:
             return []
         sync_score, sync_pos = max_sync_score(bandpass(window, fast=True))
@@ -525,6 +553,12 @@ class StreamSession:
                 "sync_pos_s": round(sync_pos / self.sr, 3) if sync_pos >= 0 else None,
             })
         return out
+
+    def scan(self) -> list[dict]:
+        """Synchronous convenience wrapper (blocks caller)."""
+        if not self.should_scan():
+            return []
+        return self.scan_window(self.snapshot())
 
     def status(self) -> dict:
         sync_score, sync_pos = max_sync_score(bandpass(self._buf, fast=True))

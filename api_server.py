@@ -34,7 +34,7 @@ from encode_duration import check_encode_fit, estimate_encode_duration
 
 configure_decoder(airplay=True)
 
-_decode_pool = ThreadPoolExecutor(max_workers=1)
+_decode_pool = ThreadPoolExecutor(max_workers=2)
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -197,12 +197,30 @@ async def decode_upload(file: UploadFile = File(...)) -> DecodeResponse:
 async def ws_decode(ws: WebSocket) -> None:
     await ws.accept()
     session = StreamSession(airplay=True)
+    loop = asyncio.get_running_loop()
+    scanning = False  # guard: at most one heavy scan in flight
+
     await ws.send_json({
         "type": "ready",
         "sample_rate": CFG.sample_rate,
         "buffer_seconds": session.buffer_seconds,
         "chunk_format": "float32_le_mono",
     })
+
+    async def maybe_scan() -> None:
+        """Offload the CPU-heavy decode to a thread so the event loop (and the
+        WS ping/pong) stays responsive — otherwise the connection drops (1006)."""
+        nonlocal scanning
+        if scanning or not session.should_scan():
+            return
+        scanning = True
+        window = session.snapshot()
+        try:
+            hits = await loop.run_in_executor(_decode_pool, session.scan_window, window)
+            for hit in hits:
+                await ws.send_json({"type": "decoded", **hit})
+        finally:
+            scanning = False
 
     try:
         while True:
@@ -225,9 +243,11 @@ async def ws_decode(ws: WebSocket) -> None:
                     session.set_input_sample_rate(sr)
                     await ws.send_json({"type": "started", "sample_rate": sr})
                 elif msg_type == "ping":
-                    await ws.send_json({"type": "pong", **session.status()})
+                    st = await loop.run_in_executor(_decode_pool, session.status)
+                    await ws.send_json({"type": "pong", **st})
                 elif msg_type == "status":
-                    await ws.send_json({"type": "status", **session.status()})
+                    st = await loop.run_in_executor(_decode_pool, session.status)
+                    await ws.send_json({"type": "status", **st})
                 else:
                     await ws.send_json({"type": "error", "message": f"unknown type: {msg_type}"})
                 continue
@@ -245,9 +265,7 @@ async def ws_decode(ws: WebSocket) -> None:
 
             chunk = np.frombuffer(data, dtype=np.float32)
             session.push_pcm(chunk)
-
-            for hit in session.scan():
-                await ws.send_json({"type": "decoded", **hit})
+            await maybe_scan()
 
     except WebSocketDisconnect:
         pass
