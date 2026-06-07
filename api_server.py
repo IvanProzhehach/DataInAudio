@@ -24,6 +24,8 @@ from pydantic import BaseModel
 
 from codec import CFG
 from decoder import (
+    API_BUILD,
+    CLOUD_FAST,
     MAX_DECODE_SECONDS,
     MAX_UPLOAD_BYTES,
     StreamSession,
@@ -104,6 +106,8 @@ def health() -> dict:
     return {
         "status": "ok",
         "decoder": "acousteg-v6",
+        "build": API_BUILD,
+        "cloud_fast": CLOUD_FAST,
         "sample_rate": CFG.sample_rate,
         "airplay_band_hz": [CFG.band_low, CFG.band_high],
     }
@@ -198,18 +202,19 @@ async def ws_decode(ws: WebSocket) -> None:
     await ws.accept()
     session = StreamSession(airplay=True)
     loop = asyncio.get_running_loop()
-    scanning = False  # guard: at most one heavy scan in flight
+    pcm_queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=256)
+    stop = asyncio.Event()
+    scanning = False
 
     await ws.send_json({
         "type": "ready",
         "sample_rate": CFG.sample_rate,
         "buffer_seconds": session.buffer_seconds,
         "chunk_format": "float32_le_mono",
+        "build": API_BUILD,
     })
 
-    async def maybe_scan() -> None:
-        """Offload the CPU-heavy decode to a thread so the event loop (and the
-        WS ping/pong) stays responsive — otherwise the connection drops (1006)."""
+    async def run_scan() -> None:
         nonlocal scanning
         if scanning or not session.should_scan():
             return
@@ -221,6 +226,20 @@ async def ws_decode(ws: WebSocket) -> None:
                 await ws.send_json({"type": "decoded", **hit})
         finally:
             scanning = False
+
+    async def scanner_loop() -> None:
+        """Drain PCM and scan without blocking WS receive (ping/pong stay alive)."""
+        while not stop.is_set():
+            drained = False
+            while not pcm_queue.empty():
+                chunk = pcm_queue.get_nowait()
+                session.push_pcm(chunk)
+                drained = True
+            if drained or session.should_scan():
+                await run_scan()
+            await asyncio.sleep(0.05)
+
+    scanner_task = asyncio.create_task(scanner_loop())
 
     try:
         while True:
@@ -239,15 +258,16 @@ async def ws_decode(ws: WebSocket) -> None:
                 msg_type = payload.get("type")
                 if msg_type == "start":
                     session.reset()
+                    while not pcm_queue.empty():
+                        pcm_queue.get_nowait()
                     sr = int(payload.get("sample_rate", CFG.sample_rate))
                     session.set_input_sample_rate(sr)
-                    await ws.send_json({"type": "started", "sample_rate": sr})
-                elif msg_type == "ping":
-                    st = await loop.run_in_executor(_decode_pool, session.status)
-                    await ws.send_json({"type": "pong", **st})
-                elif msg_type == "status":
-                    st = await loop.run_in_executor(_decode_pool, session.status)
-                    await ws.send_json({"type": "status", **st})
+                    await ws.send_json({"type": "started", "sample_rate": sr, "build": API_BUILD})
+                elif msg_type in ("ping", "status"):
+                    await ws.send_json({
+                        "type": "pong" if msg_type == "ping" else "status",
+                        **session.status(light=True),
+                    })
                 else:
                     await ws.send_json({"type": "error", "message": f"unknown type: {msg_type}"})
                 continue
@@ -264,8 +284,22 @@ async def ws_decode(ws: WebSocket) -> None:
                 continue
 
             chunk = np.frombuffer(data, dtype=np.float32)
-            session.push_pcm(chunk)
-            await maybe_scan()
+            try:
+                pcm_queue.put_nowait(chunk)
+            except asyncio.QueueFull:
+                # Drop oldest chunk rather than block the receive loop.
+                try:
+                    pcm_queue.get_nowait()
+                    pcm_queue.put_nowait(chunk)
+                except asyncio.QueueEmpty:
+                    pass
 
     except WebSocketDisconnect:
         pass
+    finally:
+        stop.set()
+        scanner_task.cancel()
+        try:
+            await scanner_task
+        except asyncio.CancelledError:
+            pass

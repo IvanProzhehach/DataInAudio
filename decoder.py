@@ -39,8 +39,10 @@ SYNC_HOP = 64
 SYNC_THRESH = 0.30
 AIRPLAY_MODE = False
 MIN_PAYLOAD_LEN = 12
-REALTIME_SCAN_SEC = 30.0
-REALTIME_SCAN_INTERVAL = 1.0
+REALTIME_SCAN_SEC = float(os.getenv("ACOUSTEG_WS_BUFFER_SEC", "30"))
+REALTIME_SCAN_INTERVAL = float(os.getenv("ACOUSTEG_SCAN_INTERVAL_SEC", "1.0"))
+CLOUD_FAST = os.getenv("ACOUSTEG_CLOUD_FAST", "1") == "1"
+API_BUILD = "2026-06-08-ws2"
 MAX_DECODE_SECONDS = float(os.getenv("ACOUSTEG_MAX_DECODE_SEC", "90"))
 MAX_UPLOAD_BYTES = int(os.getenv("ACOUSTEG_MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
 # Cap how many symbols a single frame attempt reads. 128 payload bytes easily
@@ -350,7 +352,7 @@ def verify_symbols(symbols: str) -> Optional[str]:
     return None
 
 
-def decode_at(work: np.ndarray, sync_start: int) -> Optional[str]:
+def decode_at(work: np.ndarray, sync_start: int, *, fast_timing: bool = False) -> Optional[str]:
     cache = _get_cache()
     sym_len = cache.tone_len()
     step = sym_len + cache.guard_len()
@@ -373,13 +375,19 @@ def decode_at(work: np.ndarray, sync_start: int) -> Optional[str]:
         return hit
     best = None
     coarse = 0
-    for offset in range(-2400, 2401, 256):
+    if fast_timing:
+        coarse_range = range(-1024, 1025, 512)
+        fine_span, fine_step = 200, 128
+    else:
+        coarse_range = range(-2400, 2401, 256)
+        fine_span, fine_step = 300, 64
+    for offset in coarse_range:
         hit = _try(offset)
         if hit and (best is None or len(hit) > len(best)):
             best, coarse = hit, offset
             if len(hit) >= 19:
                 return hit
-    for offset in range(coarse - 300, coarse + 301, 64):
+    for offset in range(coarse - fine_span, coarse + fine_span + 1, fine_step):
         hit = _try(offset)
         if hit and (best is None or len(hit) > len(best)):
             best = hit
@@ -388,18 +396,29 @@ def decode_at(work: np.ndarray, sync_start: int) -> Optional[str]:
     return best
 
 
-def decode_audio(audio: np.ndarray, sample_rate: int, *, realtime: bool = False) -> list[dict]:
+def decode_audio(
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    realtime: bool = False,
+    fast_timing: bool = False,
+) -> list[dict]:
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     if sample_rate != CFG.sample_rate:
         audio = resample(audio, int(len(audio) * CFG.sample_rate / sample_rate)).astype(np.float64)
     work = bandpass(audio, fast=True)
-    syncs = find_sync_positions(work, require_room=realtime or AIRPLAY_MODE)
-    candidates = syncs if (realtime or AIRPLAY_MODE) else sorted({0} | set(syncs))
+    use_fast = fast_timing or (realtime and CLOUD_FAST)
+    if realtime and CLOUD_FAST:
+        sync_score, sync_pos = max_sync_score(work)
+        candidates = [sync_pos] if sync_pos >= 0 and sync_score >= SYNC_THRESH else []
+    else:
+        syncs = find_sync_positions(work, require_room=realtime or AIRPLAY_MODE)
+        candidates = syncs if (realtime or AIRPLAY_MODE) else sorted({0} | set(syncs))
     results: list[dict] = []
     seen: set[str] = set()
     for pos in candidates:
-        text = decode_at(work, pos)
+        text = decode_at(work, pos, fast_timing=use_fast)
         if text and text not in seen:
             seen.add(text)
             results.append({"time_s": round(pos / CFG.sample_rate, 3), "payload": text})
@@ -484,6 +503,8 @@ class StreamSession:
         self._repeat = repeat
         self._input_sr = self.sr
         self.total_samples = 0
+        self._last_sync_score = 0.0
+        self._last_sync_pos = -1
 
     def reset(self) -> None:
         self._buf.fill(0.0)
@@ -492,6 +513,8 @@ class StreamSession:
         self._cooldown = 0.0
         self._last_scan = 0.0
         self.total_samples = 0
+        self._last_sync_score = 0.0
+        self._last_sync_pos = -1
 
     def set_input_sample_rate(self, sample_rate: int) -> None:
         if sample_rate <= 0:
@@ -535,8 +558,10 @@ class StreamSession:
         if len(window) < self._min_samples:
             return []
         sync_score, sync_pos = max_sync_score(bandpass(window, fast=True))
+        self._last_sync_score = sync_score
+        self._last_sync_pos = sync_pos
         out: list[dict] = []
-        for hit in decode_audio(window, self.sr, realtime=True):
+        for hit in decode_audio(window, self.sr, realtime=True, fast_timing=CLOUD_FAST):
             p = hit["payload"]
             if self._repeat:
                 if now - self._last_decode_mono < self._tile_interval * 0.7:
@@ -560,8 +585,14 @@ class StreamSession:
             return []
         return self.scan_window(self.snapshot())
 
-    def status(self) -> dict:
-        sync_score, sync_pos = max_sync_score(bandpass(self._buf, fast=True))
+    def status(self, *, light: bool = False) -> dict:
+        """light=True: skip bandpass (for WS ping — must stay instant)."""
+        if light:
+            sync_score, sync_pos = self._last_sync_score, self._last_sync_pos
+        else:
+            sync_score, sync_pos = max_sync_score(bandpass(self._buf, fast=True))
+            self._last_sync_score = sync_score
+            self._last_sync_pos = sync_pos
         filled = min(self.total_samples, self._buf_len)
         return {
             "sync_score": round(sync_score, 3),
@@ -571,4 +602,5 @@ class StreamSession:
             "filled_seconds": round(filled / self.sr, 2),
             "sample_rate": self.sr,
             "input_sample_rate": self._input_sr,
+            "build": API_BUILD,
         }
