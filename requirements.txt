@@ -1,0 +1,7 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+numpy>=1.26.0
+scipy>=1.11.0
+pydub>=0.25.1
+reedsolo>=1.7.0
