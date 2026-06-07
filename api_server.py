@@ -3,6 +3,7 @@ AcouSteg v6 — Decode API for Render.
 
   GET  /health
   POST /api/decode
+  POST /api/encode-duration
   WS   /ws/decode
 
 Local: uvicorn api_server:app --reload --port 8000
@@ -19,7 +20,9 @@ from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from decoder import CFG, StreamSession, configure_decoder, decode_bytes
+from codec import CFG
+from decoder import StreamSession, configure_decoder, decode_bytes
+from encode_duration import check_encode_fit, estimate_encode_duration
 
 configure_decoder(airplay=True)
 
@@ -46,6 +49,24 @@ class DecodeResponse(BaseModel):
     message: Optional[str] = None
 
 
+class EncodeDurationRequest(BaseModel):
+    text: str
+    audio_duration_s: Optional[float] = None
+
+
+class EncodeDurationResponse(BaseModel):
+    ok: bool
+    duration_s: float
+    symbols: int
+    payload_bytes: int
+    utf8_bytes: int
+    fits: Optional[bool] = None
+    audio_duration_s: Optional[float] = None
+    shortfall_s: Optional[float] = None
+    tiles: Optional[int] = None
+    message: Optional[str] = None
+
+
 @app.get("/health")
 def health() -> dict:
     return {
@@ -54,6 +75,41 @@ def health() -> dict:
         "sample_rate": CFG.sample_rate,
         "airplay_band_hz": [CFG.band_low, CFG.band_high],
     }
+
+
+@app.post("/api/encode-duration", response_model=EncodeDurationResponse)
+def encode_duration(req: EncodeDurationRequest) -> EncodeDurationResponse:
+    text = req.text.strip()
+    if not text:
+        return EncodeDurationResponse(
+            ok=False,
+            duration_s=0.0,
+            symbols=0,
+            payload_bytes=0,
+            utf8_bytes=0,
+            message="text must not be empty",
+        )
+    try:
+        if req.audio_duration_s is not None:
+            info = check_encode_fit(text, req.audio_duration_s)
+        else:
+            info = estimate_encode_duration(text)
+    except Exception as exc:
+        return EncodeDurationResponse(
+            ok=False,
+            duration_s=0.0,
+            symbols=0,
+            payload_bytes=0,
+            utf8_bytes=0,
+            message=str(exc),
+        )
+    return EncodeDurationResponse(
+        ok=True,
+        message=None if info.get("fits", True) else (
+            f"audio too short: need {info['duration_s']}s, got {info['audio_duration_s']}s"
+        ),
+        **info,
+    )
 
 
 @app.post("/api/decode", response_model=DecodeResponse)
