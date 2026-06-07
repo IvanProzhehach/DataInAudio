@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import io
+import os
 import time
 import wave
 from typing import Optional
 
 import numpy as np
-from scipy.signal import butter, resample, sosfiltfilt
+from scipy.signal import butter, resample, sosfilt, sosfiltfilt
 
 try:
     from pydub import AudioSegment
@@ -31,7 +32,7 @@ from codec import (
     PREAMBLE_LEN,
     PREAMBLE_SYM,
     SYMBOL_CHARS,
-    max_frame_samples,
+    frame_samples,
     octal_symbols_for_bytes,
 )
 SYNC_HOP = 64
@@ -40,6 +41,10 @@ AIRPLAY_MODE = False
 MIN_PAYLOAD_LEN = 12
 REALTIME_SCAN_SEC = 30.0
 REALTIME_SCAN_INTERVAL = 1.0
+MAX_DECODE_SECONDS = float(os.getenv("ACOUSTEG_MAX_DECODE_SEC", "90"))
+MAX_UPLOAD_BYTES = int(os.getenv("ACOUSTEG_MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
+
+_SOS: Optional[np.ndarray] = None
 
 
 def configure_decoder(*, airplay: bool = True) -> None:
@@ -140,10 +145,34 @@ def _goertzel_power(chunk: np.ndarray, freq: float, sr: int) -> float:
     return max(s2 * s2 + s1 * s1 - c * s1 * s2, 1e-20)
 
 
-def bandpass(audio: np.ndarray) -> np.ndarray:
-    nyq = 0.5 * CFG.sample_rate
-    sos = butter(6, [CFG.band_low / nyq, CFG.band_high / nyq], btype="band", output="sos")
-    return sosfiltfilt(sos, audio.astype(np.float64))
+def _get_sos() -> np.ndarray:
+    global _SOS
+    if _SOS is None:
+        nyq = 0.5 * CFG.sample_rate
+        _SOS = butter(6, [CFG.band_low / nyq, CFG.band_high / nyq], btype="band", output="sos")
+    return _SOS
+
+
+def bandpass(audio: np.ndarray, *, fast: bool = False) -> np.ndarray:
+    """fast=True: single-pass sosfilt (API / long files). Default: sosfiltfilt (higher quality)."""
+    x = audio.astype(np.float64, copy=False)
+    sos = _get_sos()
+    if fast or len(x) > CFG.sample_rate * 45:
+        return sosfilt(sos, x)
+    return sosfiltfilt(sos, x)
+
+
+def wav_info(data: bytes) -> dict:
+    with wave.open(io.BytesIO(data), "rb") as wf:
+        sr = wf.getframerate()
+        frames = wf.getnframes()
+        return {
+            "sample_rate": sr,
+            "channels": wf.getnchannels(),
+            "sample_width": wf.getsampwidth(),
+            "frames": frames,
+            "duration_s": round(frames / sr, 3) if sr else 0.0,
+        }
 
 
 def _ncc_dot(chunk: np.ndarray, ref_norm: np.ndarray) -> float:
@@ -169,11 +198,16 @@ def max_sync_score(audio: np.ndarray) -> tuple[float, int]:
     return best_score, best_pos
 
 
+def _room_samples() -> int:
+    """Min audio tail after sync for typical payloads (mic / airplay)."""
+    return frame_samples(48)
+
+
 def find_sync_positions(audio: np.ndarray, *, require_room: bool = False) -> list[int]:
     cache = _get_cache()
     sync_len = cache.sync_len()
     ref = cache.sync_norm()
-    need = max_frame_samples() if require_room else 0
+    need = _room_samples() if require_room else 0
     positions: list[int] = []
     best_pos, best_score = -sync_len, 0.0
     for start in range(0, len(audio) - sync_len, SYNC_HOP):
@@ -298,7 +332,11 @@ def verify_symbols(symbols: str) -> Optional[str]:
 
 
 def decode_at(work: np.ndarray, sync_start: int) -> Optional[str]:
-    if sync_start + max_frame_samples() > len(work):
+    cache = _get_cache()
+    sym_len = cache.tone_len()
+    step = sym_len + cache.guard_len()
+    min_tail = cache.sync_len() + cache.guard_len() + step * (PREAMBLE_LEN + LENGTH_SYM + 4)
+    if sync_start < 0 or sync_start + min_tail > len(work):
         return None
 
     if not AIRPLAY_MODE:
@@ -306,7 +344,7 @@ def decode_at(work: np.ndarray, sync_start: int) -> Optional[str]:
 
     def _try(offset: int) -> Optional[str]:
         pos = sync_start + offset
-        if pos < 0 or pos + max_frame_samples() > len(work):
+        if pos < 0 or pos + min_tail > len(work):
             return None
         eq = _estimate_eq(work, pos)
         return verify_symbols(decode_symbols(work, pos, eq))
@@ -336,7 +374,7 @@ def decode_audio(audio: np.ndarray, sample_rate: int, *, realtime: bool = False)
         audio = audio.mean(axis=1)
     if sample_rate != CFG.sample_rate:
         audio = resample(audio, int(len(audio) * CFG.sample_rate / sample_rate)).astype(np.float64)
-    work = bandpass(audio)
+    work = bandpass(audio, fast=True)
     syncs = find_sync_positions(work, require_room=realtime or AIRPLAY_MODE)
     candidates = syncs if (realtime or AIRPLAY_MODE) else sorted({0} | set(syncs))
     results: list[dict] = []
@@ -351,13 +389,24 @@ def decode_audio(audio: np.ndarray, sample_rate: int, *, realtime: bool = False)
     return results
 
 
-def load_audio_bytes(data: bytes) -> tuple[np.ndarray, int]:
+def load_audio_bytes(data: bytes, *, max_seconds: Optional[float] = None) -> tuple[np.ndarray, int, dict]:
+    """Load mono float64 audio; truncate to max_seconds for cloud safety."""
+    limit = max_seconds if max_seconds is not None else MAX_DECODE_SECONDS
+    meta: dict = {"truncated": False, "duration_s": None, "used_seconds": None}
+
     try:
         with wave.open(io.BytesIO(data), "rb") as wf:
             sr = wf.getframerate()
             nch = wf.getnchannels()
             sw = wf.getsampwidth()
-            frames = wf.readframes(wf.getnframes())
+            total = wf.getnframes()
+            meta["duration_s"] = round(total / sr, 3) if sr else 0.0
+            take = total
+            if sr > 0 and limit > 0:
+                take = min(total, int(limit * sr))
+                meta["truncated"] = take < total
+            meta["used_seconds"] = round(take / sr, 3) if sr else 0.0
+            frames = wf.readframes(take)
             if sw == 1:
                 audio = np.frombuffer(frames, dtype=np.uint8).astype(np.float64)
                 audio = (audio - 128.0) / 128.0
@@ -369,19 +418,32 @@ def load_audio_bytes(data: bytes) -> tuple[np.ndarray, int]:
                 raise ValueError(f"unsupported sample width: {sw}")
             if nch > 1:
                 audio = audio.reshape(-1, nch).mean(axis=1)
-            return audio, sr
+            return audio, sr, meta
     except (wave.Error, ValueError):
         seg = (AudioSegment.from_file(io.BytesIO(data))
                .set_frame_rate(CFG.sample_rate)
                .set_channels(1)
                .set_sample_width(4))
+        dur_ms = len(seg)
+        meta["duration_s"] = round(dur_ms / 1000.0, 3)
+        if limit > 0 and dur_ms > limit * 1000:
+            seg = seg[: int(limit * 1000)]
+            meta["truncated"] = True
+        meta["used_seconds"] = round(len(seg) / 1000.0, 3)
         audio = np.frombuffer(seg.raw_data, dtype=np.int32).astype(np.float64) / 2**31
-        return audio, CFG.sample_rate
+        return audio, CFG.sample_rate, meta
 
 
-def decode_bytes(data: bytes, *, realtime: bool = False) -> list[dict]:
-    audio, sr = load_audio_bytes(data)
-    return decode_audio(audio, sr, realtime=realtime)
+def decode_bytes(data: bytes, *, realtime: bool = False, airplay: Optional[bool] = None) -> tuple[list[dict], dict]:
+    prev_airplay = AIRPLAY_MODE
+    if airplay is not None:
+        configure_decoder(airplay=airplay)
+    try:
+        audio, sr, meta = load_audio_bytes(data)
+        return decode_audio(audio, sr, realtime=realtime), meta
+    finally:
+        if airplay is not None:
+            configure_decoder(airplay=prev_airplay)
 
 
 class StreamSession:
@@ -391,10 +453,10 @@ class StreamSession:
         configure_decoder(airplay=airplay)
         self.sr = CFG.sample_rate
         cache = _get_cache()
-        self._scan_sec = max(REALTIME_SCAN_SEC, max_frame_samples() / CFG.sample_rate + 5)
+        self._scan_sec = max(REALTIME_SCAN_SEC, _room_samples() / CFG.sample_rate + 5)
         self._buf_len = int(self._scan_sec * self.sr) + cache.sync_len()
-        self._min_samples = max_frame_samples()
-        self._tile_interval = max_frame_samples() / CFG.sample_rate
+        self._min_samples = _room_samples()
+        self._tile_interval = _room_samples() / CFG.sample_rate
         self._buf = np.zeros(self._buf_len, dtype=np.float64)
         self._seen: set[str] = set()
         self._last_decode_mono = 0.0
@@ -444,7 +506,7 @@ class StreamSession:
         window = self._buf.copy()
         if len(window) < self._min_samples:
             return []
-        sync_score, sync_pos = max_sync_score(bandpass(window))
+        sync_score, sync_pos = max_sync_score(bandpass(window, fast=True))
         out: list[dict] = []
         for hit in decode_audio(window, self.sr, realtime=True):
             p = hit["payload"]
@@ -465,7 +527,7 @@ class StreamSession:
         return out
 
     def status(self) -> dict:
-        sync_score, sync_pos = max_sync_score(bandpass(self._buf))
+        sync_score, sync_pos = max_sync_score(bandpass(self._buf, fast=True))
         filled = min(self.total_samples, self._buf_len)
         return {
             "sync_score": round(sync_score, 3),

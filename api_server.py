@@ -11,8 +11,10 @@ Local: uvicorn api_server:app --reload --port 8000
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import numpy as np
@@ -21,10 +23,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from codec import CFG
-from decoder import StreamSession, configure_decoder, decode_bytes
+from decoder import (
+    MAX_DECODE_SECONDS,
+    MAX_UPLOAD_BYTES,
+    StreamSession,
+    configure_decoder,
+    decode_bytes,
+)
 from encode_duration import check_encode_fit, estimate_encode_duration
 
 configure_decoder(airplay=True)
+
+_decode_pool = ThreadPoolExecutor(max_workers=1)
 
 ALLOWED_ORIGINS = [
     o.strip()
@@ -47,6 +57,9 @@ class DecodeResponse(BaseModel):
     ok: bool
     frames: list[dict]
     message: Optional[str] = None
+    duration_s: Optional[float] = None
+    used_seconds: Optional[float] = None
+    truncated: Optional[bool] = None
 
 
 class EncodeDurationRequest(BaseModel):
@@ -73,10 +86,15 @@ def root() -> dict:
         "service": "AcouSteg v6 Decode API",
         "endpoints": {
             "health": "GET /health",
-            "decode": "POST /api/decode  (multipart field: file)",
+            "decode": f"POST /api/decode  (multipart field: file, max {MAX_UPLOAD_BYTES // 1024 // 1024}MB, "
+                      f"first {MAX_DECODE_SECONDS:.0f}s decoded)",
             "encode_duration": "POST /api/encode-duration  (json: {text, audio_duration_s?})",
             "live_decode": "WS /ws/decode",
             "docs": "GET /docs",
+        },
+        "limits": {
+            "max_upload_mb": MAX_UPLOAD_BYTES // 1024 // 1024,
+            "max_decode_sec": MAX_DECODE_SECONDS,
         },
     }
 
@@ -131,13 +149,48 @@ async def decode_upload(file: UploadFile = File(...)) -> DecodeResponse:
     data = await file.read()
     if not data:
         return DecodeResponse(ok=False, frames=[], message="empty file")
+    if len(data) > MAX_UPLOAD_BYTES:
+        mb = MAX_UPLOAD_BYTES // 1024 // 1024
+        return DecodeResponse(
+            ok=False, frames=[],
+            message=f"file too large ({len(data) / 1024 / 1024:.1f} MB, max {mb} MB)",
+        )
     try:
-        frames = decode_bytes(data, realtime=True)
+        loop = asyncio.get_running_loop()
+        frames, meta = await asyncio.wait_for(
+            loop.run_in_executor(
+                _decode_pool,
+                lambda: decode_bytes(data, realtime=False, airplay=False),
+            ),
+            timeout=float(os.getenv("ACOUSTEG_DECODE_TIMEOUT_SEC", "55")),
+        )
+    except asyncio.TimeoutError:
+        return DecodeResponse(
+            ok=False, frames=[],
+            message=f"decode timeout — use first {MAX_DECODE_SECONDS:.0f}s of audio or shorter file",
+        )
+    except MemoryError:
+        return DecodeResponse(ok=False, frames=[], message="out of memory — file too long for free tier")
     except Exception as exc:
         return DecodeResponse(ok=False, frames=[], message=str(exc))
+
+    note = None
+    if meta.get("truncated"):
+        note = (
+            f"decoded first {meta['used_seconds']}s of {meta['duration_s']}s "
+            f"(limit {MAX_DECODE_SECONDS:.0f}s on cloud)"
+        )
     if not frames:
-        return DecodeResponse(ok=True, frames=[], message="no v6 frame found")
-    return DecodeResponse(ok=True, frames=frames)
+        return DecodeResponse(
+            ok=True, frames=[], message=note or "no v6 frame found",
+            duration_s=meta.get("duration_s"), used_seconds=meta.get("used_seconds"),
+            truncated=meta.get("truncated"),
+        )
+    return DecodeResponse(
+        ok=True, frames=frames, message=note,
+        duration_s=meta.get("duration_s"), used_seconds=meta.get("used_seconds"),
+        truncated=meta.get("truncated"),
+    )
 
 
 @app.websocket("/ws/decode")
