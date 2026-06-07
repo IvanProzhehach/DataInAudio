@@ -67,6 +67,20 @@ class EncodeDurationResponse(BaseModel):
     message: Optional[str] = None
 
 
+@app.get("/")
+def root() -> dict:
+    return {
+        "service": "AcouSteg v6 Decode API",
+        "endpoints": {
+            "health": "GET /health",
+            "decode": "POST /api/decode  (multipart field: file)",
+            "encode_duration": "POST /api/encode-duration  (json: {text, audio_duration_s?})",
+            "live_decode": "WS /ws/decode",
+            "docs": "GET /docs",
+        },
+    }
+
+
 @app.get("/health")
 def health() -> dict:
     return {
