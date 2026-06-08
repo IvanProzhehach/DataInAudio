@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -152,7 +152,10 @@ def encode_duration(req: EncodeDurationRequest) -> EncodeDurationResponse:
 
 
 @app.post("/api/decode", response_model=DecodeResponse)
-async def decode_upload(file: UploadFile = File(...)) -> DecodeResponse:
+async def decode_upload(
+    file: UploadFile = File(...),
+    airplay: bool = Query(True, description="Speaker→mic decode (same as decoder_v6 --airplay)"),
+) -> DecodeResponse:
     data = await file.read()
     if not data:
         return DecodeResponse(ok=False, frames=[], message="empty file")
@@ -167,7 +170,7 @@ async def decode_upload(file: UploadFile = File(...)) -> DecodeResponse:
         frames, meta = await asyncio.wait_for(
             loop.run_in_executor(
                 _decode_pool,
-                lambda: decode_bytes(data, realtime=False, airplay=False),
+                lambda: decode_bytes(data, realtime=False, airplay=airplay),
             ),
             timeout=float(os.getenv("ACOUSTEG_DECODE_TIMEOUT_SEC", "55")),
         )

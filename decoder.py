@@ -42,7 +42,7 @@ MIN_PAYLOAD_LEN = 12
 REALTIME_SCAN_SEC = float(os.getenv("ACOUSTEG_WS_BUFFER_SEC", "30"))
 REALTIME_SCAN_INTERVAL = float(os.getenv("ACOUSTEG_SCAN_INTERVAL_SEC", "1.0"))
 CLOUD_FAST = os.getenv("ACOUSTEG_CLOUD_FAST", "1") == "1"
-API_BUILD = "2026-06-08-ws3"
+API_BUILD = "2026-06-08-rest1"
 MAX_DECODE_SECONDS = float(os.getenv("ACOUSTEG_MAX_DECODE_SEC", "90"))
 MAX_UPLOAD_BYTES = int(os.getenv("ACOUSTEG_MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
 # Cap how many symbols a single frame attempt reads. 128 payload bytes easily
