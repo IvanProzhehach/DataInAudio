@@ -560,6 +560,9 @@ class StreamSession:
         sync_score, sync_pos = max_sync_score(bandpass(window, fast=True))
         self._last_sync_score = sync_score
         self._last_sync_pos = sync_pos
+        # No usable sync → skip the (expensive) full decode entirely.
+        if sync_score < SYNC_THRESH:
+            return []
         out: list[dict] = []
         for hit in decode_audio(window, self.sr, realtime=True, fast_timing=CLOUD_FAST):
             p = hit["payload"]

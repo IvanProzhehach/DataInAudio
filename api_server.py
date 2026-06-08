@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -21,6 +22,8 @@ import numpy as np
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+logger = logging.getLogger("acousteg.ws")
 
 from codec import CFG
 from decoder import (
@@ -204,7 +207,6 @@ async def ws_decode(ws: WebSocket) -> None:
     loop = asyncio.get_running_loop()
     pcm_queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=256)
     stop = asyncio.Event()
-    scanning = False
 
     await ws.send_json({
         "type": "ready",
@@ -214,32 +216,51 @@ async def ws_decode(ws: WebSocket) -> None:
         "build": API_BUILD,
     })
 
+    scan_timeout = float(os.getenv("ACOUSTEG_SCAN_TIMEOUT_SEC", "30"))
+
     async def run_scan() -> None:
-        nonlocal scanning
-        if scanning or not session.should_scan():
-            return
-        scanning = True
+        """Heavy DSP. Runs as its own task so draining never blocks on it."""
         window = session.snapshot()
         try:
-            hits = await loop.run_in_executor(_decode_pool, session.scan_window, window)
+            hits = await asyncio.wait_for(
+                loop.run_in_executor(_decode_pool, session.scan_window, window),
+                timeout=scan_timeout,
+            )
             for hit in hits:
                 await ws.send_json({"type": "decoded", **hit})
-        finally:
-            scanning = False
+        except asyncio.TimeoutError:
+            logger.warning("scan_window exceeded %.0fs — skipped", scan_timeout)
+        except Exception as exc:  # noqa: BLE001 — a bad scan must not kill the loop
+            logger.exception("scan_window failed")
+            try:
+                await ws.send_json({"type": "scan_error", "message": str(exc)})
+            except Exception:  # noqa: BLE001 — client may already be gone
+                pass
 
     async def scanner_loop() -> None:
-        """Drain PCM and scan without blocking WS receive (ping/pong stay alive)."""
+        """Drain PCM into the rolling buffer; trigger scans without ever
+        blocking on them. The buffer keeps filling no matter how slow or
+        broken a scan is.
+        """
+        scan_task: Optional[asyncio.Task] = None
         while not stop.is_set():
-            drained = False
             while not pcm_queue.empty():
-                chunk = pcm_queue.get_nowait()
-                session.push_pcm(chunk)
-                drained = True
-            if drained or session.should_scan():
-                await run_scan()
+                session.push_pcm(pcm_queue.get_nowait())
+            scan_running = scan_task is not None and not scan_task.done()
+            if not scan_running and session.should_scan():
+                scan_task = asyncio.create_task(run_scan())
+                scan_task.add_done_callback(_log_task_error)
             await asyncio.sleep(0.05)
 
+    def _log_task_error(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("background task died", exc_info=exc)
+
     scanner_task = asyncio.create_task(scanner_loop())
+    scanner_task.add_done_callback(_log_task_error)
 
     try:
         while True:
