@@ -228,6 +228,10 @@ async def ws_decode(ws: WebSocket) -> None:
             )
             for hit in hits:
                 await ws.send_json({"type": "decoded", **hit})
+            try:
+                await ws.send_json({"type": "scan_status", **session.status(light=True)})
+            except Exception:  # noqa: BLE001
+                pass
         except asyncio.TimeoutError:
             logger.warning("scan_window exceeded %.0fs — skipped", scan_timeout)
         except Exception as exc:  # noqa: BLE001 — a bad scan must not kill the loop

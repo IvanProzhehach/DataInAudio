@@ -12,6 +12,6 @@ services:
       - key: ALLOWED_ORIGINS
         value: "*"
       - key: ACOUSTEG_CLOUD_FAST
-        value: "1"
+        value: "0"
       - key: ACOUSTEG_WS_BUFFER_SEC
         value: "22"

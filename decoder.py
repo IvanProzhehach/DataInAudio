@@ -42,7 +42,7 @@ MIN_PAYLOAD_LEN = 12
 REALTIME_SCAN_SEC = float(os.getenv("ACOUSTEG_WS_BUFFER_SEC", "30"))
 REALTIME_SCAN_INTERVAL = float(os.getenv("ACOUSTEG_SCAN_INTERVAL_SEC", "1.0"))
 CLOUD_FAST = os.getenv("ACOUSTEG_CLOUD_FAST", "1") == "1"
-API_BUILD = "2026-06-08-ws2"
+API_BUILD = "2026-06-08-ws3"
 MAX_DECODE_SECONDS = float(os.getenv("ACOUSTEG_MAX_DECODE_SEC", "90"))
 MAX_UPLOAD_BYTES = int(os.getenv("ACOUSTEG_MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
 # Cap how many symbols a single frame attempt reads. 128 payload bytes easily
@@ -505,6 +505,7 @@ class StreamSession:
         self.total_samples = 0
         self._last_sync_score = 0.0
         self._last_sync_pos = -1
+        self._last_chunk_rms = 0.0
 
     def reset(self) -> None:
         self._buf.fill(0.0)
@@ -515,6 +516,7 @@ class StreamSession:
         self.total_samples = 0
         self._last_sync_score = 0.0
         self._last_sync_pos = -1
+        self._last_chunk_rms = 0.0
 
     def set_input_sample_rate(self, sample_rate: int) -> None:
         if sample_rate <= 0:
@@ -533,6 +535,7 @@ class StreamSession:
             n_out = max(1, int(len(mono) * self.sr / self._input_sr))
             mono = resample(mono, n_out).astype(np.float64)
         n = len(mono)
+        self._last_chunk_rms = float(np.sqrt(np.mean(mono * mono))) if n else 0.0
         self.total_samples += n
         if n >= self._buf_len:
             self._buf[:] = mono[-self._buf_len:]
@@ -557,14 +560,16 @@ class StreamSession:
         self._last_scan = now
         if len(window) < self._min_samples:
             return []
-        sync_score, sync_pos = max_sync_score(bandpass(window, fast=True))
+        # Match local decoder_v6: zero-phase bandpass for short mic windows.
+        work = bandpass(window, fast=len(window) > CFG.sample_rate * 45)
+        sync_score, sync_pos = max_sync_score(work)
         self._last_sync_score = sync_score
         self._last_sync_pos = sync_pos
         # No usable sync → skip the (expensive) full decode entirely.
         if sync_score < SYNC_THRESH:
             return []
         out: list[dict] = []
-        for hit in decode_audio(window, self.sr, realtime=True, fast_timing=CLOUD_FAST):
+        for hit in decode_audio(window, self.sr, realtime=True, fast_timing=False):
             p = hit["payload"]
             if self._repeat:
                 if now - self._last_decode_mono < self._tile_interval * 0.7:
@@ -589,7 +594,13 @@ class StreamSession:
         return self.scan_window(self.snapshot())
 
     def status(self, *, light: bool = False) -> dict:
-        """light=True: skip bandpass (for WS ping — must stay instant)."""
+        """light=True: skip full-buffer bandpass scan (WS ping), but still reports
+        cheap live metrics (input RMS, sync-tone power on the last ~2 s).
+        """
+        tail_n = min(len(self._buf), int(2 * self.sr))
+        tail = self._buf[-tail_n:] if tail_n else self._buf
+        sync_tone = _goertzel_power(tail, CFG.sync_freq, self.sr) if tail_n >= 256 else 0.0
+
         if light:
             sync_score, sync_pos = self._last_sync_score, self._last_sync_pos
         else:
@@ -603,6 +614,8 @@ class StreamSession:
             "sync_pos_s": round(sync_pos / self.sr, 3) if sync_pos >= 0 else None,
             "buffer_seconds": self._scan_sec,
             "filled_seconds": round(filled / self.sr, 2),
+            "input_rms": round(self._last_chunk_rms, 5),
+            "sync_tone_power": round(sync_tone, 2),
             "sample_rate": self.sr,
             "input_sample_rate": self._input_sr,
             "build": API_BUILD,
