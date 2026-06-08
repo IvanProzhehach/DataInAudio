@@ -42,7 +42,7 @@ MIN_PAYLOAD_LEN = 12
 REALTIME_SCAN_SEC = float(os.getenv("ACOUSTEG_WS_BUFFER_SEC", "30"))
 REALTIME_SCAN_INTERVAL = float(os.getenv("ACOUSTEG_SCAN_INTERVAL_SEC", "1.0"))
 CLOUD_FAST = os.getenv("ACOUSTEG_CLOUD_FAST", "1") == "1"
-API_BUILD = "2026-06-08-mic1"
+API_BUILD = "2026-06-08-mic2"
 MIC_MAX_SECONDS = float(os.getenv("ACOUSTEG_MIC_MAX_SEC", "22"))
 MAX_DECODE_SECONDS = float(os.getenv("ACOUSTEG_MAX_DECODE_SEC", "90"))
 MAX_UPLOAD_BYTES = int(os.getenv("ACOUSTEG_MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
@@ -486,10 +486,7 @@ def decode_bytes(data: bytes, *, realtime: bool = False, airplay: Optional[bool]
 
 
 def decode_mic_chunk(data: bytes, *, max_seconds: Optional[float] = None) -> tuple[list[dict], dict]:
-    """Fast airplay decode for short browser-mic WAV chunks (chunked upload).
-
-    One sync search + one decode attempt — completes in seconds on cloud CPU.
-    """
+    """Fast airplay decode for short browser-mic WAV chunks (chunked upload)."""
     limit = MIC_MAX_SECONDS if max_seconds is None else max_seconds
     prev_airplay = AIRPLAY_MODE
     configure_decoder(airplay=True)
@@ -497,19 +494,10 @@ def decode_mic_chunk(data: bytes, *, max_seconds: Optional[float] = None) -> tup
         audio, sr, meta = load_audio_bytes(data, max_seconds=limit)
         if sr != CFG.sample_rate:
             audio = resample(audio, int(len(audio) * CFG.sample_rate / sr)).astype(np.float64)
-        work = bandpass(audio, fast=True)
-        sync_score, sync_pos = max_sync_score(work)
+        sync_score, _ = max_sync_score(bandpass(audio, fast=True))
         meta["sync_score"] = round(sync_score, 3)
-        if sync_score < SYNC_THRESH or sync_pos < 0:
-            return [], meta
-        text = decode_at(work, sync_pos, fast_timing=True)
-        if not text:
-            return [], meta
-        return [{
-            "time_s": round(sync_pos / CFG.sample_rate, 3),
-            "payload": text,
-            "sync_score": round(sync_score, 3),
-        }], meta
+        frames = decode_audio(audio, sr, realtime=True, fast_timing=True)
+        return frames, meta
     finally:
         configure_decoder(airplay=prev_airplay)
 
