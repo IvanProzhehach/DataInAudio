@@ -15,3 +15,7 @@ services:
         value: "0"
       - key: ACOUSTEG_WS_BUFFER_SEC
         value: "22"
+      - key: ACOUSTEG_MIC_MAX_SEC
+        value: "20"
+      - key: ACOUSTEG_MIC_TIMEOUT_SEC
+        value: "40"
